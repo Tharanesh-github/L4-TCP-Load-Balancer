@@ -1,10 +1,12 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,12 +150,16 @@ func handleConnection(clientConn net.Conn, serverPool *ServerPool) {
 // ==============================================================================
 
 func main() {
-	// Define our cluster of backend servers
-	servers := []string{
-		"127.0.0.1:8081",
-		"127.0.0.1:8082",
-		"127.0.0.1:8083",
-	}
+	var port int
+	var backendsList string
+
+	// CLI Flags
+	flag.IntVar(&port, "port", 8080, "Port to serve the load balancer on")
+	flag.StringVar(&backendsList, "backends", "127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083", "Comma-separated list of backend servers")
+	flag.Parse()
+
+	// Parse the comma-separated list into a slice of strings
+	servers := strings.Split(backendsList, ",")
 
 	serverPool := ServerPool{
 		backends: make([]*Backend, 0),
@@ -161,7 +167,7 @@ func main() {
 
 	for _, addr := range servers {
 		serverPool.backends = append(serverPool.backends, &Backend{
-			Address: addr,
+			Address: strings.TrimSpace(addr),
 			Alive:   true,
 		})
 	}
@@ -170,7 +176,6 @@ func main() {
 	go serverPool.HealthCheck()
 
 	// Bind the Load Balancer to a port
-	port := 8080
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatalf("Failed to bind to port %d: %s\n", port, err)
@@ -178,6 +183,7 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("🚀 Layer 4 Load Balancer started on port %d\n", port)
+	log.Printf("⚖️  Balancing traffic across: %v\n", servers)
 
 	// The Accept Loop
 	for {
