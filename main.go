@@ -6,193 +6,180 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// ==============================================================================
-// ==============================================================================
-
-// Backend represents a single downstream server instance.
-type Backend struct {
-	Address string
-	Alive   bool
-	mux     sync.RWMutex // Protects the 'Alive' state from concurrent read/writes
+// Server represents a backend target
+type Server struct {
+	URL         *url.URL
+	Alive       bool
+	mux         sync.RWMutex
+	ActiveConns int64 // NEW: Tracks current active TCP connections
 }
 
-// SetAlive safely updates the backend's status using a Write Lock.
-func (b *Backend) SetAlive(alive bool) {
-	b.mux.Lock()
-	b.Alive = alive
-	b.mux.Unlock()
+// SetAlive safely updates the health status
+func (s *Server) SetAlive(alive bool) {
+	s.mux.Lock()
+	s.Alive = alive
+	s.mux.Unlock()
 }
 
-// IsAlive safely reads the backend's status using a Read Lock.
-func (b *Backend) IsAlive() bool {
-	b.mux.RLock()
-	alive := b.Alive
-	b.mux.RUnlock()
-	return alive
+// IsAlive safely reads the health status
+func (s *Server) IsAlive() (alive bool) {
+	s.mux.RLock()
+	alive = s.Alive
+	s.mux.RUnlock()
+	return
 }
 
-// ServerPool manages the list of backends and the routing state.
+// GetActiveConns safely reads the current active connection count
+func (s *Server) GetActiveConns() int64 {
+	return atomic.LoadInt64(&s.ActiveConns)
+}
+
+// ServerPool holds all of our backend targets
 type ServerPool struct {
-	backends []*Backend
-	current  uint64 // Atomic counter for thread-safe Round Robin routing
+	Servers []*Server
 }
 
-// ==============================================================================
-// ==============================================================================
+// NextPeer implements the LEAST CONNECTIONS routing algorithm
+func (s *ServerPool) NextPeer() *Server {
+	var bestServer *Server
+	var minConns int64 = -1 // -1 acts as our initial "unassigned" state
 
-// NextIndex atomically increments the counter and returns a safe index.
-// Using atomic operations avoids lock contention during high throughput.
-func (s *ServerPool) NextIndex() int {
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
-}
-
-// GetNextPeer returns the next available backend server.
-func (s *ServerPool) GetNextPeer() *Backend {
-	// Loop through backends to find an alive one
-	next := s.NextIndex()
-	l := len(s.backends) + next // start from next and do a full cycle
-	for i := next; i < l; i++ {
-		idx := i % len(s.backends)
-		if s.backends[idx].IsAlive() {
-			if i != next {
-				// Atomically update the current index if we had to skip dead servers
-				atomic.StoreUint64(&s.current, uint64(idx))
+	for _, server := range s.Servers {
+		if server.IsAlive() {
+			conns := server.GetActiveConns()
+			// If we haven't picked a server yet, OR this server has fewer connections than our current best
+			if bestServer == nil || conns < minConns {
+				bestServer = server
+				minConns = conns
 			}
-			return s.backends[idx]
 		}
 	}
-	return nil // Total failure: No backends are alive
+	return bestServer
 }
 
-// ==============================================================================
-// ==============================================================================
-
-// HealthCheck pings the backends every few seconds to update their status.
-func (s *ServerPool) HealthCheck() {
+// healthCheck pings the backend servers every 10 seconds
+func healthCheck(serverPool *ServerPool) {
+	t := time.NewTicker(10 * time.Second)
 	for {
-		for _, b := range s.backends {
-			status := "UP"
-			// TCP Ping with a 2-second timeout
-			conn, err := net.DialTimeout("tcp", b.Address, 2*time.Second)
+		<-t.C
+		// FIXED: Changed 's.Servers' to 'serverPool.Servers'
+		for _, server := range serverPool.Servers {
+			conn, err := net.DialTimeout("tcp", server.URL.Host, 2*time.Second)
 			if err != nil {
-				b.SetAlive(false)
-				status = "DOWN"
-			} else {
-				b.SetAlive(true)
-				conn.Close()
+				server.SetAlive(false)
+				log.Printf("HealthCheck: [ %s ] is DOWN\n", server.URL.Host)
+				continue
 			}
-			log.Printf("HealthCheck: [ %s ] is %s", b.Address, status)
+			conn.Close()
+			if !server.IsAlive() {
+				server.SetAlive(true)
+				log.Printf("HealthCheck: [ %s ] is UP\n", server.URL.Host)
+			}
 		}
-		time.Sleep(10 * time.Second)
 	}
 }
 
-// ==============================================================================
-// ==============================================================================
+// handleConnection proxies the raw TCP traffic
+func handleConnection(clientConn net.Conn, serverPool *ServerPool) {
+	defer clientConn.Close()
 
-// proxy handles bidirectional data transfer between the client and the chosen backend.
-func proxy(clientConn net.Conn, backend *Backend) {
-	// Attempt to connect to the backend server
-	backendConn, err := net.DialTimeout("tcp", backend.Address, 5*time.Second)
-	if err != nil {
-		log.Printf("Failed to connect to backend %s: %s\n", backend.Address, err)
-		clientConn.Close()
-		backend.SetAlive(false) // Mark dead immediately on connection refused
+	// 1. Find the server with the LEAST connections
+	targetServer := serverPool.NextPeer()
+	if targetServer == nil {
+		log.Println("❌ No alive servers available")
 		return
 	}
 
-	// Ensure both connections are closed when the function exits
-	defer clientConn.Close()
-	defer backendConn.Close()
+	// 2. Increment active connections atomically
+	atomic.AddInt64(&targetServer.ActiveConns, 1)
 
-	// Bidirectional copy using Goroutines
-	// io.Copy handles the raw byte streaming at the transport layer
+	// 3. Ensure we decrement the counter when the client disconnects
+	defer atomic.AddInt64(&targetServer.ActiveConns, -1)
+
+	log.Printf("Routing %s -> %s (Active Connections on target: %d)\n", clientConn.RemoteAddr(), targetServer.URL.Host, targetServer.GetActiveConns())
+
+	// 4. Dial the backend server
+	serverConn, err := net.DialTimeout("tcp", targetServer.URL.Host, 5*time.Second)
+	if err != nil {
+		log.Printf("Error connecting to backend %s: %s\n", targetServer.URL.Host, err)
+		targetServer.SetAlive(false)
+		return
+	}
+	defer serverConn.Close()
+
+	// 5. Proxy the bidirectional traffic using wait groups
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Backend
+	// Copy from Client -> Server
 	go func() {
 		defer wg.Done()
-		io.Copy(backendConn, clientConn)
-		backendConn.(*net.TCPConn).CloseWrite() // Signal EOF
+		io.Copy(serverConn, clientConn)
+		if tcpConn, ok := serverConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 	}()
 
-	// Backend -> Client
+	// Copy from Server -> Client
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, backendConn)
-		clientConn.(*net.TCPConn).CloseWrite() // Signal EOF
+		io.Copy(clientConn, serverConn)
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 	}()
 
 	wg.Wait()
 }
 
-// handleConnection assigns an incoming connection to a backend and proxies it.
-func handleConnection(clientConn net.Conn, serverPool *ServerPool) {
-	backend := serverPool.GetNextPeer()
-	if backend == nil {
-		log.Println("503 Service Unavailable: No backends alive")
-		clientConn.Close()
-		return
-	}
-
-	log.Printf("Routing %s -> %s\n", clientConn.RemoteAddr(), backend.Address)
-	proxy(clientConn, backend)
-}
-
-// ==============================================================================
-// ==============================================================================
-
 func main() {
 	var port int
-	var backendsList string
+	var backends string
 
-	// CLI Flags
-	flag.IntVar(&port, "port", 8080, "Port to serve the load balancer on")
-	flag.StringVar(&backendsList, "backends", "127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083", "Comma-separated list of backend servers")
+	flag.IntVar(&port, "port", 8080, "Port to serve load balancer on")
+	flag.StringVar(&backends, "backends", "127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083", "Comma separated list of backends")
 	flag.Parse()
 
-	// Parse the comma-separated list into a slice of strings
-	servers := strings.Split(backendsList, ",")
+	backendList := strings.Split(backends, ",")
+	serverPool := ServerPool{}
 
-	serverPool := ServerPool{
-		backends: make([]*Backend, 0),
-	}
-
-	for _, addr := range servers {
-		serverPool.backends = append(serverPool.backends, &Backend{
-			Address: strings.TrimSpace(addr),
-			Alive:   true,
+	for _, backend := range backendList {
+		serverURL, err := url.Parse(fmt.Sprintf("http://%s", backend))
+		if err != nil {
+			log.Fatal(err)
+		}
+		serverPool.Servers = append(serverPool.Servers, &Server{
+			URL:   serverURL,
+			Alive: true,
 		})
 	}
 
-	// Launch the health checker as a background Goroutine
-	go serverPool.HealthCheck()
+	// Start health checker in the background
+	go healthCheck(&serverPool)
 
-	// Bind the Load Balancer to a port
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("Failed to bind to port %d: %s\n", port, err)
+		log.Fatal(err)
 	}
 	defer listener.Close()
 
 	log.Printf("🚀 Layer 4 Load Balancer started on port %d\n", port)
-	log.Printf("⚖️  Balancing traffic across: %v\n", servers)
+	log.Printf("⚖️  Routing Algorithm: LEAST CONNECTIONS\n")
 
-	// The Accept Loop
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Failed to accept connection: %s\n", err)
 			continue
 		}
-		// Spawn a new Goroutine for EVERY incoming connection (Highly concurrent!)
+		// Spawn a lightweight goroutine for every single connection
 		go handleConnection(clientConn, &serverPool)
 	}
 }
